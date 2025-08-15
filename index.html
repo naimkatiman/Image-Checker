@@ -79,6 +79,8 @@ https://www.facebook.com/permalink.php?id=..."
                 </div>
             </div>
 
+            
+
             <!-- Loading Indicator -->
             <div id="loadingDiv" class="hidden text-center py-8">
                 <div class="loading-spinner mx-auto mb-4"></div>
@@ -98,7 +100,7 @@ https://www.facebook.com/permalink.php?id=..."
                                 <tr class="text-left text-gray-600">
                                     <th class="px-4 py-2">Name</th>
                                     <th class="px-4 py-2">Image</th>
-                                    <th class="px-4 py-2">Caption Extractor</th>
+                                    <th class="px-4 py-2">Caption</th>
                                 </tr>
                             </thead>
                             <tbody id="resultsBody" class="bg-white divide-y divide-gray-100"></tbody>
@@ -145,6 +147,8 @@ https://www.facebook.com/permalink.php?id=..."
         dropArea.addEventListener('dragleave', handleDragLeave);
         fileInput.addEventListener('change', handleFileSelect);
         analyzeBtn.addEventListener('click', analyzePosts);
+
+        
 
         function handleDragOver(e) {
             e.preventDefault();
@@ -193,6 +197,8 @@ https://www.facebook.com/permalink.php?id=..."
             reader.readAsDataURL(file);
         }
 
+        
+
         async function analyzePosts() {
             const linksText = (facebookLinks.value || '').trim();
 
@@ -231,38 +237,88 @@ https://www.facebook.com/permalink.php?id=..."
         }
 
         async function analyzeLinksWithAI(links) {
-            const numberedList = links.map((l, i) => `${i + 1}. ${l}`).join('\n');
-            const prompt = `You are a strict JSON generator. Given a list of Facebook post URLs and one reference image, output ONLY a minified JSON array (no markdown, no commentary). One object per URL with EXACTLY these keys: \n- name: best guess of the page/profile name derived from the URL; if unknown, use \"unknown\".\n- image: either \"same\" or \"relative\". Use \"same\" only if the post image appears identical or near-identical to the provided reference image. Otherwise use \"relative\".\n- caption: the extracted caption/post text if accessible; otherwise use an empty string. Always prefix the value with \">>> \".\n\nInput URLs:\n${numberedList}\n\nReturn only JSON like this: [{\"name\":\"...\",\"image\":\"relative\",\"caption\":\">>> ...\"}]`;
+            // 1) Scrape metadata for each link on the server (name, caption, og:image)
+            const metas = await Promise.all(links.map(scrapeFacebookMeta));
 
-            const response = await fetch('/.netlify/functions/openrouter-proxy', {
+            // 2) pHash-based comparison without AI
+            const statuses = await Promise.all(
+                metas.map(meta => classifySameRelative(referenceImageBase64, meta.imageUrl))
+            );
+
+            // 3) Build final results (exactly 3 fields)
+            return metas.map((m, i) => ({
+                name: normalizeName(m.name),
+                image: statuses[i],
+                caption: formatCaption(m.caption)
+            }));
+        }
+
+        async function scrapeFacebookMeta(url) {
+            const res = await fetch('/.netlify/functions/fb-scrape', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    model: MODEL_NAME,
-                    messages: [
-                        {
-                            role: 'user',
-                            content: [
-                                { type: 'text', text: prompt },
-                                { type: 'image_url', image_url: { url: referenceImageBase64 } }
-                            ]
-                        }
-                    ],
-                    max_tokens: 600
-                })
+                body: JSON.stringify({ url })
             });
-
-            if (!response.ok) {
-                throw new Error(`API request failed: ${response.status}`);
+            if (!res.ok) {
+                return { name: 'unknown', caption: '', imageUrl: '' };
             }
+            return res.json();
+        }
 
-            const data = await response.json();
-            const aiText = data.choices?.[0]?.message?.content || '';
-            const json = extractJsonArray(aiText);
-            if (!Array.isArray(json)) {
-                throw new Error('Invalid AI response format.');
+        // ---- Non-AI image comparison (aHash/pHash-like) ----
+        async function classifySameRelative(referenceDataUrl, postImageUrl) {
+            if (!postImageUrl) return 'relative';
+            try {
+                const refHash = await imageDataUrlToHash(referenceDataUrl);
+                const proxied = await fetch('/.netlify/functions/image-proxy', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ url: postImageUrl })
+                });
+                if (!proxied.ok) return 'relative';
+                const { dataUrl } = await proxied.json();
+                const postHash = await imageDataUrlToHash(dataUrl);
+                const dist = hamming(refHash, postHash);
+                return dist <= 6 ? 'same' : 'relative';
+            } catch (_) {
+                return 'relative';
             }
-            return json;
+        }
+
+        async function imageDataUrlToHash(dataUrl) {
+            const img = new Image();
+            img.src = dataUrl;
+            await img.decode();
+            const size = 8;
+            const canvas = document.createElement('canvas');
+            canvas.width = size; canvas.height = size;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(img, 0, 0, size, size);
+            const { data } = ctx.getImageData(0, 0, size, size);
+            const gray = [];
+            for (let i = 0; i < data.length; i += 4) {
+                gray.push(0.299 * data[i] + 0.587 * data[i+1] + 0.114 * data[i+2]);
+            }
+            const avg = gray.reduce((a,b)=>a+b,0) / gray.length;
+            return gray.map(v => (v > avg ? '1' : '0')).join('');
+        }
+
+        function hamming(a, b) {
+            let d = 0; const n = Math.min(a.length, b.length);
+            for (let i = 0; i < n; i++) if (a[i] !== b[i]) d++;
+            return d;
+        }
+
+        // ---- Name/Caption normalization ----
+        function normalizeName(name) {
+            const n = (name || '').trim();
+            if (!n) return 'unknown';
+            // Strip common suffixes like " - Posts | Facebook"
+            return n.replace(/\s*-\s*Posts\s*\|\s*Facebook$/i, '').trim();
+        }
+
+        function formatCaption(caption) {
+            const c = (caption || '').trim();
+            return c ? c : '';
         }
 
         function extractJsonArray(text) {
@@ -288,14 +344,15 @@ https://www.facebook.com/permalink.php?id=..."
         function renderResults(items) {
             resultsBody.innerHTML = items.map(item => {
                 const name = sanitize(String(item.name || 'unknown'));
-                const image = String(item.image || 'relative') === 'same' ? 'same' : 'relative';
-                const captionRaw = String(item.caption || '');
-                const caption = sanitize(captionRaw.startsWith('>>>') ? captionRaw : `>>> ${captionRaw}`);
-                const badgeClass = image === 'same' ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-700';
+                const isSame = String(item.image || 'relative') === 'same';
+                const imageText = isSame ? 'Same' : 'not same';
+                const captionText = String(item.caption || '');
+                const caption = sanitize(captionText.startsWith('caption:') ? captionText : `caption: ${captionText}`);
+                const badgeClass = isSame ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-700';
                 return `
                     <tr>
                         <td class="px-4 py-2 align-top">${name}</td>
-                        <td class="px-4 py-2 align-top"><span class="px-2 py-1 rounded ${badgeClass}">${image}</span></td>
+                        <td class="px-4 py-2 align-top"><span class="px-2 py-1 rounded ${badgeClass}">${imageText}</span></td>
                         <td class="px-4 py-2 align-top whitespace-pre-wrap">${caption}</td>
                     </tr>
                 `;
