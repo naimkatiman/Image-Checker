@@ -35,6 +35,10 @@ exports.handler = async function (event) {
   try {
     // Parse incoming JSON
     const payload = event.body ? JSON.parse(event.body) : {};
+    // Ensure default model if not provided
+    if (!payload.model) {
+      payload.model = process.env.OPENROUTER_DEFAULT_MODEL || 'google/gemini-2.0-flash-001';
+    }
 
     // Compose headers required by OpenRouter
     const referer = process.env.URL || event.headers?.referer || '';
