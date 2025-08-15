@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>AI Image Checker & Facebook Caption Extractor</title>
+    <link rel="icon" type="image/svg+xml" href="favicon.svg">
     <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/css/all.min.css">
     <style>
@@ -126,15 +127,13 @@ https://www.facebook.com/permalink.php?id=..."
         const fileInput = document.getElementById('fileInput');
         const imagePreview = document.getElementById('imagePreview');
         const previewImg = document.getElementById('previewImg');
-        const facebookLink = document.getElementById('facebookLink');
+        const facebookLinks = document.getElementById('facebookLinks');
         const analyzeBtn = document.getElementById('analyzeBtn');
         const loadingDiv = document.getElementById('loadingDiv');
         const resultsSection = document.getElementById('resultsSection');
         const errorDiv = document.getElementById('errorDiv');
         const errorMessage = document.getElementById('errorMessage');
-        const comparisonResult = document.getElementById('comparisonResult');
-        const comparisonDetails = document.getElementById('comparisonDetails');
-        const captionResult = document.getElementById('captionResult');
+        const resultsBody = document.getElementById('resultsBody');
 
         let referenceImageBase64 = null;
 
@@ -145,7 +144,7 @@ https://www.facebook.com/permalink.php?id=..."
         dropArea.addEventListener('dragenter', handleDragEnter);
         dropArea.addEventListener('dragleave', handleDragLeave);
         fileInput.addEventListener('change', handleFileSelect);
-        analyzeBtn.addEventListener('click', analyzePost);
+        analyzeBtn.addEventListener('click', analyzePosts);
 
         function handleDragOver(e) {
             e.preventDefault();
@@ -194,21 +193,26 @@ https://www.facebook.com/permalink.php?id=..."
             reader.readAsDataURL(file);
         }
 
-        async function analyzePost() {
-            const fbLink = facebookLink.value.trim();
-            
+        async function analyzePosts() {
+            const linksText = (facebookLinks.value || '').trim();
+
             if (!referenceImageBase64) {
                 showError('Please upload a reference image first.');
                 return;
             }
 
-            if (!fbLink) {
-                showError('Please enter a Facebook post link.');
+            if (!linksText) {
+                showError('Please enter at least one Facebook post link.');
                 return;
             }
 
-            if (!fbLink.includes('facebook.com')) {
-                showError('Please enter a valid Facebook link.');
+            const links = linksText
+                .split(/\r?\n/)
+                .map(l => l.trim())
+                .filter(l => l.length > 0 && l.includes('facebook.com'));
+
+            if (links.length === 0) {
+                showError('Please provide valid Facebook links (one per line).');
                 return;
             }
 
@@ -216,12 +220,9 @@ https://www.facebook.com/permalink.php?id=..."
             hideError();
 
             try {
-                // First, let's try to get the Facebook post content
-                const postContent = await fetchFacebookPost(fbLink);
-                
-                // Analyze the post with AI
-                await analyzeWithAI(postContent, fbLink);
-                
+                const results = await analyzeLinksWithAI(links);
+                renderResults(results);
+                hideLoading();
             } catch (error) {
                 console.error('Analysis error:', error);
                 showError(`Analysis failed: ${error.message}`);
@@ -229,109 +230,84 @@ https://www.facebook.com/permalink.php?id=..."
             }
         }
 
-        async function fetchFacebookPost(url) {
-            // Since we can't directly access Facebook due to CORS, we'll use a different approach
-            // We'll let the AI analyze the URL and try to extract what it can
-            return {
-                url: url,
-                type: 'facebook_link'
-            };
-        }
+        async function analyzeLinksWithAI(links) {
+            const numberedList = links.map((l, i) => `${i + 1}. ${l}`).join('\n');
+            const prompt = `You are a strict JSON generator. Given a list of Facebook post URLs and one reference image, output ONLY a minified JSON array (no markdown, no commentary). One object per URL with EXACTLY these keys: \n- name: best guess of the page/profile name derived from the URL; if unknown, use \"unknown\".\n- image: either \"same\" or \"relative\". Use \"same\" only if the post image appears identical or near-identical to the provided reference image. Otherwise use \"relative\".\n- caption: the extracted caption/post text if accessible; otherwise use an empty string. Always prefix the value with \">>> \".\n\nInput URLs:\n${numberedList}\n\nReturn only JSON like this: [{\"name\":\"...\",\"image\":\"relative\",\"caption\":\">>> ...\"}]`;
 
-        async function analyzeWithAI(postContent, fbLink) {
-            try {
-                const prompt = `
-                You are an AI assistant that analyzes Facebook posts and compares images. I have provided:
-                1. A reference image (base64 encoded)
-                2. A Facebook post URL: ${fbLink}
+            const response = await fetch('/.netlify/functions/openrouter-proxy', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    model: MODEL_NAME,
+                    messages: [
+                        {
+                            role: 'user',
+                            content: [
+                                { type: 'text', text: prompt },
+                                { type: 'image_url', image_url: { url: referenceImageBase64 } }
+                            ]
+                        }
+                    ],
+                    max_tokens: 600
+                })
+            });
 
-                Please help me with:
-                1. Since I cannot directly access the Facebook post content due to CORS restrictions, please analyze what you can from the URL structure and provide guidance on how to extract the post caption/message.
-                2. If there were images in the Facebook post, how would you compare them with my reference image?
-                3. Provide suggestions for how to better implement this functionality.
-
-                For the image comparison, assume there might be an image in the Facebook post and describe how you would determine if it matches the reference image I provided.
-
-                Please structure your response as:
-                - Image Comparison: [Your analysis approach]
-                - Caption Extraction: [Suggestions for extracting Facebook post text]
-                - Implementation Notes: [Technical recommendations]
-                `;
-
-                const response = await fetch('/.netlify/functions/openrouter-proxy', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify({
-                        model: MODEL_NAME,
-                        messages: [
-                            {
-                                role: 'user',
-                                content: [
-                                    {
-                                        type: 'text',
-                                        text: prompt
-                                    },
-                                    {
-                                        type: 'image_url',
-                                        image_url: {
-                                            url: referenceImageBase64
-                                        }
-                                    }
-                                ]
-                            }
-                        ],
-                        max_tokens: 1000
-                    })
-                });
-
-                if (!response.ok) {
-                    throw new Error(`API request failed: ${response.status}`);
-                }
-
-                const data = await response.json();
-                const aiResponse = data.choices[0].message.content;
-
-                displayResults(aiResponse, fbLink);
-                hideLoading();
-
-            } catch (error) {
-                console.error('AI Analysis error:', error);
-                showError(`AI analysis failed: ${error.message}`);
-                hideLoading();
+            if (!response.ok) {
+                throw new Error(`API request failed: ${response.status}`);
             }
+
+            const data = await response.json();
+            const aiText = data.choices?.[0]?.message?.content || '';
+            const json = extractJsonArray(aiText);
+            if (!Array.isArray(json)) {
+                throw new Error('Invalid AI response format.');
+            }
+            return json;
         }
 
-        function displayResults(aiResponse, fbLink) {
-            // Parse AI response and display results
-            const lines = aiResponse.split('\n').filter(line => line.trim());
-            
-            // Display comparison result
-            comparisonResult.innerHTML = `
-                <div class="flex items-center gap-2">
-                    <i class="fas fa-info-circle text-blue-500"></i>
-                    <span class="text-blue-600">Analysis Complete</span>
-                </div>
-            `;
-            
-            comparisonDetails.innerHTML = `
-                <p class="mb-2"><strong>Facebook URL:</strong> ${fbLink}</p>
-                <p class="text-sm text-gray-500">Due to CORS restrictions, direct Facebook content access is limited. See AI recommendations below.</p>
-            `;
+        function extractJsonArray(text) {
+            try {
+                return JSON.parse(text);
+            } catch (_) {}
+            // Try code block removal
+            const matchCode = text.match(/```[\s\S]*?```/);
+            if (matchCode) {
+                const inner = matchCode[0].replace(/```json|```/g, '').trim();
+                try { return JSON.parse(inner); } catch (_) {}
+            }
+            // Try bracket slicing
+            const start = text.indexOf('[');
+            const end = text.lastIndexOf(']');
+            if (start !== -1 && end !== -1 && end > start) {
+                const slice = text.slice(start, end + 1);
+                try { return JSON.parse(slice); } catch (_) {}
+            }
+            return null;
+        }
 
-            // Display AI response as caption/analysis
-            captionResult.innerHTML = `
-                <div class="whitespace-pre-wrap text-gray-700">${aiResponse}</div>
-                <div class="mt-4 p-3 bg-yellow-50 border-l-4 border-yellow-400 rounded">
-                    <p class="text-sm text-yellow-800">
-                        <i class="fas fa-lightbulb mr-1"></i>
-                        <strong>Note:</strong> This is an AI analysis and recommendations. For full functionality, you may need to implement server-side scraping or use Facebook's official API.
-                    </p>
-                </div>
-            `;
-
+        function renderResults(items) {
+            resultsBody.innerHTML = items.map(item => {
+                const name = sanitize(String(item.name || 'unknown'));
+                const image = String(item.image || 'relative') === 'same' ? 'same' : 'relative';
+                const captionRaw = String(item.caption || '');
+                const caption = sanitize(captionRaw.startsWith('>>>') ? captionRaw : `>>> ${captionRaw}`);
+                const badgeClass = image === 'same' ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-700';
+                return `
+                    <tr>
+                        <td class="px-4 py-2 align-top">${name}</td>
+                        <td class="px-4 py-2 align-top"><span class="px-2 py-1 rounded ${badgeClass}">${image}</span></td>
+                        <td class="px-4 py-2 align-top whitespace-pre-wrap">${caption}</td>
+                    </tr>
+                `;
+            }).join('');
             resultsSection.classList.remove('hidden');
+        }
+
+        function sanitize(str) {
+            return str
+                .replaceAll('&', '&amp;')
+                .replaceAll('<', '&lt;')
+                .replaceAll('>', '&gt;');
         }
 
         function showLoading() {
