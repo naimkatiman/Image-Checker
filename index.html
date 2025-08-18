@@ -262,7 +262,12 @@ https://www.facebook.com/permalink.php?id=..."
             if (!res.ok) {
                 return { name: 'unknown', caption: '', imageUrl: '' };
             }
-            return res.json();
+            const data = await res.json();
+            return {
+                name: data.name || 'unknown',
+                caption: data.caption || '',
+                imageUrl: data.imageUrl || ''
+            };
         }
 
         // ---- Non-AI image comparison (aHash/pHash-like) ----

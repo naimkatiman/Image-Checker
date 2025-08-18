@@ -24,9 +24,9 @@ exports.handler = async function (event) {
     const { url } = JSON.parse(event.body || '{}');
     if (!url || typeof url !== 'string') {
       return {
-        statusCode: 400,
+        statusCode: 200,
         headers: { 'Content-Type': 'application/json', ...corsHeaders },
-        body: JSON.stringify({ error: 'Missing url' }),
+        body: JSON.stringify({ ok: false, reason: 'missing-url', name: 'unknown', caption: '', imageUrl: '' }),
       };
     }
 
@@ -37,24 +37,19 @@ exports.handler = async function (event) {
 
     for (const candidate of candidates) {
       tried.push(candidate);
-      const res = await fetch(candidate, {
-        headers: buildHeaders(),
-        redirect: 'follow',
-      }).catch(() => null);
-      if (res && res.ok) {
-        try {
-          html = await res.text();
-          finalUrl = res.url || candidate;
-          if (containsOg(html)) break;
-        } catch (_) {}
+      const res = await safeFetch(candidate, { headers: buildHeaders(), redirect: 'follow' });
+      if (res && res.ok && res.text) {
+        html = res.text;
+        finalUrl = res.url || candidate;
+        if (containsOg(html)) break;
       }
     }
 
     if (!html) {
       return {
-        statusCode: 502,
+        statusCode: 200,
         headers: { 'Content-Type': 'application/json', ...corsHeaders },
-        body: JSON.stringify({ error: 'Failed to fetch page', tried }),
+        body: JSON.stringify({ ok: false, reason: 'fetch-failed', tried, name: 'unknown', caption: '', imageUrl: '' }),
       };
     }
 
@@ -62,19 +57,13 @@ exports.handler = async function (event) {
     return {
       statusCode: 200,
       headers: { 'Content-Type': 'application/json', ...corsHeaders },
-      body: JSON.stringify({
-        inputUrl: url,
-        finalUrl,
-        name: meta.name || 'unknown',
-        caption: meta.caption || '',
-        imageUrl: meta.image || '',
-      }),
+      body: JSON.stringify({ ok: true, inputUrl: url, finalUrl, name: meta.name || 'unknown', caption: meta.caption || '', imageUrl: meta.image || '' }),
     };
   } catch (err) {
     return {
-      statusCode: 500,
+      statusCode: 200,
       headers: { 'Content-Type': 'application/json', ...corsHeaders },
-      body: JSON.stringify({ error: 'Scrape failed', details: String(err) }),
+      body: JSON.stringify({ ok: false, reason: 'exception', details: String(err), name: 'unknown', caption: '', imageUrl: '' }),
     };
   }
 };
@@ -95,6 +84,20 @@ function buildCandidateUrls(input) {
   if (!hosts.includes('mbasic.facebook.com')) hosts.push('mbasic.facebook.com');
   const paths = u.href.substring(u.origin.length);
   return hosts.map(h => `https://${h}${paths}`);
+}
+
+async function safeFetch(url, opts) {
+  try {
+    const controller = new AbortController();
+    const id = setTimeout(() => controller.abort(), 8000);
+    const res = await fetch(url, { ...(opts||{}), signal: controller.signal }).catch(() => null);
+    clearTimeout(id);
+    if (!res) return null;
+    const text = await res.text().catch(() => '');
+    return { ok: res.ok, status: res.status, url: res.url, text };
+  } catch (_) {
+    return null;
+  }
 }
 
 function containsOg(html) {
