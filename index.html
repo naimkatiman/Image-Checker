@@ -283,7 +283,7 @@ https://www.facebook.com/permalink.php?id=..."
                 const { dataUrl } = await proxied.json();
                 const postHash = await imageDataUrlToHash(dataUrl);
                 const dist = hamming(refHash, postHash);
-                return dist <= 6 ? 'same' : 'relative';
+                return dist <= 10 ? 'same' : 'relative';
             } catch (_) {
                 return 'relative';
             }

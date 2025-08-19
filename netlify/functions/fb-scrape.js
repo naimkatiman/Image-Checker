@@ -32,16 +32,22 @@ exports.handler = async function (event) {
 
     const tried = [];
     const candidates = buildCandidateUrls(url);
+    const userAgents = ['chrome', 'fb'];
     let html = null;
     let finalUrl = null;
 
-    for (const candidate of candidates) {
-      tried.push(candidate);
-      const res = await safeFetch(candidate, { headers: buildHeaders(), redirect: 'follow' });
-      if (res && res.ok && res.text) {
-        html = res.text;
-        finalUrl = res.url || candidate;
-        if (containsOg(html)) break;
+    outer: for (const candidate of candidates) {
+      for (const ua of userAgents) {
+        tried.push(`${candidate} [ua:${ua}]`);
+        const res = await safeFetch(candidate, { headers: buildHeaders(ua), redirect: 'follow' });
+        if (res && res.ok && res.text) {
+          const text = res.text;
+          if (containsOg(text) && !isFacebookLoginInterstitial(text)) {
+            html = text;
+            finalUrl = res.url || candidate;
+            break outer;
+          }
+        }
       }
     }
 
@@ -68,9 +74,12 @@ exports.handler = async function (event) {
   }
 };
 
-function buildHeaders() {
+function buildHeaders(uaVariant) {
+  const ua = uaVariant === 'fb'
+    ? 'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext/)'
+    : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
   return {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+    'User-Agent': ua,
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
     'Accept-Language': 'en-US,en;q=0.9',
     'Cache-Control': 'no-cache',
@@ -111,13 +120,16 @@ function extractMeta(html, baseUrl) {
   const ogTitle = pick(/<meta\s+property=["']og:title["']\s+content=["']([^"']*)["'][^>]*>/i);
   const ogDesc = pick(/<meta\s+property=["']og:description["']\s+content=["']([^"']*)["'][^>]*>/i);
   const ogImage = pick(/<meta\s+property=["']og:image["']\s+content=["']([^"']*)["'][^>]*>/i);
+  const ogImageSecure = pick(/<meta\s+property=["']og:image:secure_url["']\s+content=["']([^"']*)["'][^>]*>/i);
+  const ogImageUrl = pick(/<meta\s+property=["']og:image:url["']\s+content=["']([^"']*)["'][^>]*>/i);
   const ogSite = pick(/<meta\s+property=["']og:site_name["']\s+content=["']([^"']*)["'][^>]*>/i);
   const twDesc = pick(/<meta\s+name=["']twitter:description["']\s+content=["']([^"']*)["'][^>]*>/i);
   const titleTag = extractTitle(html);
 
-  let image = ogImage;
+  let image = ogImage || ogImageSecure || ogImageUrl;
   if (image) {
     try { image = new URL(image, baseUrl).href; } catch (_) {}
+    image = unwrapSafeImage(image);
   }
 
   const name = ogSite || ogTitle || titleTag || '';
@@ -137,6 +149,29 @@ function decodeHtml(str) {
     .replace(/&gt;/g, '>')
     .replace(/&quot;/g, '"')
     .replace(/&#39;/g, "'");
+}
+
+function unwrapSafeImage(imageUrl) {
+  try {
+    const u = new URL(imageUrl);
+    if (u.pathname.includes('/safe_image.php')) {
+      const original = u.searchParams.get('url');
+      if (original) {
+        try { return new URL(decodeURIComponent(original)).href; } catch (_) { return decodeURIComponent(original); }
+      }
+    }
+    return imageUrl;
+  } catch (_) {
+    return imageUrl;
+  }
+}
+
+function isFacebookLoginInterstitial(html) {
+  if (!html) return false;
+  if (/See\s+posts,\s+photos\s+and\s+more\s+on\s+Facebook/i.test(html)) return true;
+  if (/Log\s*in\s*or\s*sign\s*up\s*to\s*view/i.test(html)) return true;
+  if (/Log\s*into\s*Facebook/i.test(html)) return true;
+  return false;
 }
 
 
