@@ -212,10 +212,10 @@ https://www.facebook.com/permalink.php?id=..."
                 return;
             }
 
-            const links = linksText
-                .split(/\r?\n/)
-                .map(l => l.trim())
-                .filter(l => l.length > 0 && l.includes('facebook.com'));
+            // Extract valid Facebook URLs from free-form input (handles prefixes like "@" or "Repost link:")
+            const urlRegex = /(https?:\/\/(?:www\.)?facebook\.com\/[^\s<>"')]+)/gi;
+            const links = Array.from(new Set((linksText.match(urlRegex) || [])
+                .map(u => u.replace(/^@+/, '').trim())));
 
             if (links.length === 0) {
                 showError('Please provide valid Facebook links (one per line).');
@@ -240,13 +240,16 @@ https://www.facebook.com/permalink.php?id=..."
             // 1) Scrape metadata for each link on the server (name, caption, og:image)
             const metas = await Promise.all(links.map(scrapeFacebookMeta));
 
-            // 2) pHash-based comparison without AI
+            // 2) Try AI enhancement for name/caption when missing or generic
+            const aiEnhanced = await Promise.all(metas.map((m, idx) => maybeAiEnhance(m, links[idx])));
+
+            // 3) pHash-based comparison without AI
             const statuses = await Promise.all(
-                metas.map(meta => classifySameRelative(referenceImageBase64, meta.imageUrl))
+                aiEnhanced.map(meta => classifySameRelative(referenceImageBase64, meta.imageUrl))
             );
 
-            // 3) Build final results (exactly 3 fields)
-            return metas.map((m, i) => ({
+            // 4) Build final results (exactly 3 fields)
+            return aiEnhanced.map((m, i) => ({
                 name: normalizeName(m.name),
                 image: statuses[i],
                 caption: formatCaption(m.caption)
@@ -260,32 +263,35 @@ https://www.facebook.com/permalink.php?id=..."
                 body: JSON.stringify({ url })
             });
             if (!res.ok) {
-                return { name: 'unknown', caption: '', imageUrl: '' };
+                return { name: 'unknown', caption: '', imageUrl: '', ogTitle: '', ogDesc: '', rawTitle: '' };
             }
             const data = await res.json();
             return {
                 name: data.name || 'unknown',
                 caption: data.caption || '',
-                imageUrl: data.imageUrl || ''
+                imageUrl: data.imageUrl || '',
+                ogTitle: data.ogTitle || '',
+                ogDesc: data.ogDesc || '',
+                rawTitle: data.rawTitle || ''
             };
         }
 
         // ---- Non-AI image comparison (aHash/pHash-like) ----
         async function classifySameRelative(referenceDataUrl, postImageUrl) {
-            if (!postImageUrl) return 'relative';
+            if (!postImageUrl) return 'not same';
             try {
                 const refHash = await imageDataUrlToHash(referenceDataUrl);
                 const proxied = await fetch('/.netlify/functions/image-proxy', {
                     method: 'POST', headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ url: postImageUrl })
                 });
-                if (!proxied.ok) return 'relative';
+                if (!proxied.ok) return 'not same';
                 const { dataUrl } = await proxied.json();
                 const postHash = await imageDataUrlToHash(dataUrl);
                 const dist = hamming(refHash, postHash);
-                return dist <= 10 ? 'same' : 'relative';
+                return dist <= 10 ? 'same' : 'not same';
             } catch (_) {
-                return 'relative';
+                return 'not same';
             }
         }
 
@@ -326,6 +332,76 @@ https://www.facebook.com/permalink.php?id=..."
             return c ? c : '';
         }
 
+        async function maybeAiEnhance(meta, url) {
+            const nameIsGeneric = !meta.name || /^\s*$/.test(meta.name) || /^(unknown|facebook)$/i.test(meta.name);
+            const captionIsMissing = !meta.caption || /^\s*$/.test(meta.caption);
+            if (!nameIsGeneric && !captionIsMissing) return meta;
+
+            try {
+                const improved = await aiExtractFields({
+                    url,
+                    name: meta.name || '',
+                    caption: meta.caption || '',
+                    ogTitle: meta.ogTitle || '',
+                    ogDesc: meta.ogDesc || '',
+                    rawTitle: meta.rawTitle || ''
+                });
+                return {
+                    ...meta,
+                    name: improved.name || meta.name || 'unknown',
+                    caption: improved.caption || meta.caption || ''
+                };
+            } catch (e) {
+                return meta;
+            }
+        }
+
+        async function aiExtractFields(payload) {
+            const system = 'You are a precise extractor. From the provided Facebook-like metadata, return a minimal JSON object with keys name and caption. Do not invent facts. If unavailable, leave as empty string.';
+            const user = `Input JSON:\n${JSON.stringify(payload)}`;
+            const res = await fetch('/.netlify/functions/openrouter-proxy', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    model: MODEL_NAME,
+                    messages: [
+                        { role: 'system', content: system },
+                        { role: 'user', content: user }
+                    ],
+                    temperature: 0.0
+                })
+            });
+            if (!res.ok) throw new Error('AI request failed');
+            const data = await res.json();
+            const text = data?.choices?.[0]?.message?.content || '';
+            const obj = extractJsonObject(text) || safeDirectJson(text);
+            if (obj && typeof obj === 'object') return { name: obj.name || '', caption: obj.caption || '' };
+            return { name: '', caption: '' };
+        }
+
+        function extractJsonObject(text) {
+            try { const o = JSON.parse(text); return typeof o === 'object' ? o : null; } catch (_) {}
+            const matchCode = text.match(/```[\s\S]*?```/);
+            if (matchCode) {
+                const inner = matchCode[0].replace(/```json|```/g, '').trim();
+                try { const o = JSON.parse(inner); return typeof o === 'object' ? o : null; } catch (_) {}
+            }
+            const start = text.indexOf('{');
+            const end = text.lastIndexOf('}');
+            if (start !== -1 && end !== -1 && end > start) {
+                const slice = text.slice(start, end + 1);
+                try { const o = JSON.parse(slice); return typeof o === 'object' ? o : null; } catch (_) {}
+            }
+            return null;
+        }
+
+        function safeDirectJson(text) {
+            if (!text) return null;
+            const m = text.match(/\{\s*\"name\"[\s\S]*\}\s*$/);
+            if (!m) return null;
+            try { return JSON.parse(m[0]); } catch (_) { return null; }
+        }
+
         function extractJsonArray(text) {
             try {
                 return JSON.parse(text);
@@ -349,11 +425,11 @@ https://www.facebook.com/permalink.php?id=..."
         function renderResults(items) {
             resultsBody.innerHTML = items.map(item => {
                 const name = sanitize(String(item.name || 'unknown'));
-                const isSame = String(item.image || 'relative') === 'same';
-                const imageText = isSame ? 'Same' : 'not same';
+                const isSame = String(item.image || 'not same') === 'same';
+                const imageText = isSame ? 'same' : 'not same';
                 const captionText = String(item.caption || '');
-                const caption = sanitize(captionText.startsWith('caption:') ? captionText : `caption: ${captionText}`);
-                const badgeClass = isSame ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-700';
+                const caption = sanitize(captionText);
+                const badgeClass = isSame ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700';
                 return `
                     <tr>
                         <td class="px-4 py-2 align-top">${name}</td>

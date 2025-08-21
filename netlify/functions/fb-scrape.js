@@ -63,7 +63,17 @@ exports.handler = async function (event) {
     return {
       statusCode: 200,
       headers: { 'Content-Type': 'application/json', ...corsHeaders },
-      body: JSON.stringify({ ok: true, inputUrl: url, finalUrl, name: meta.name || 'unknown', caption: meta.caption || '', imageUrl: meta.image || '' }),
+      body: JSON.stringify({
+        ok: true,
+        inputUrl: url,
+        finalUrl,
+        name: meta.name || 'unknown',
+        caption: meta.caption || '',
+        imageUrl: meta.image || '',
+        ogTitle: meta.ogTitle || '',
+        ogDesc: meta.ogDesc || '',
+        rawTitle: meta.rawTitle || ''
+      }),
     };
   } catch (err) {
     return {
@@ -134,7 +144,7 @@ function extractMeta(html, baseUrl) {
 
   const name = ogSite || ogTitle || titleTag || '';
   const caption = ogDesc || twDesc || '';
-  return { name, caption, image };
+  return { name, caption, image, ogTitle, ogDesc, rawTitle: titleTag };
 }
 
 function extractTitle(html) {
