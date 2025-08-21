@@ -38,15 +38,33 @@ exports.handler = async function (event) {
 	}
 
 	try {
-		// Prepare chromium
-		const executablePath = await chromium.executablePath();
-		const browser = await puppeteer.launch({
-			args: chromium.args,
-			defaultViewport: { width: 640, height: 1024 },
-			executablePath,
-			headless: chromium.headless,
-			ignoreHTTPSErrors: true,
-		});
+		let browser = null;
+		let usedFallback = false;
+		// Try Lambda-compatible Chromium first (production)
+		try {
+			const executablePath = await chromium.executablePath();
+			browser = await puppeteer.launch({
+				args: chromium.args,
+				defaultViewport: { width: 640, height: 1024 },
+				executablePath,
+				headless: chromium.headless,
+				ignoreHTTPSErrors: true,
+			});
+		} catch (primaryErr) {
+			// Local fallback (Windows/Netlify CLI) using full Puppeteer bundled Chrome
+			try {
+				const puppeteerLocal = require('puppeteer');
+				browser = await puppeteerLocal.launch({
+					headless: true,
+					defaultViewport: { width: 640, height: 1024 },
+					ignoreHTTPSErrors: true,
+					args: ['--no-sandbox', '--disable-setuid-sandbox']
+				});
+				usedFallback = true;
+			} catch (fallbackErr) {
+				throw new Error(`Chromium launch failed and local fallback not available. Primary: ${primaryErr?.message}; Fallback: ${fallbackErr?.message}`);
+			}
+		}
 
 		const page = await browser.newPage();
 		// Use a mobile-ish UA to increase chances of seeing content on m/mbasic
