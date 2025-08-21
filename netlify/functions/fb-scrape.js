@@ -42,7 +42,7 @@ exports.handler = async function (event) {
         const res = await safeFetch(candidate, { headers: buildHeaders(ua), redirect: 'follow' });
         if (res && res.ok && res.text) {
           const text = res.text;
-          if (containsOg(text) && !isFacebookLoginInterstitial(text)) {
+          if (!isFacebookLoginInterstitial(text)) {
             html = text;
             finalUrl = res.url || candidate;
             break outer;
@@ -72,7 +72,8 @@ exports.handler = async function (event) {
         imageUrl: meta.image || '',
         ogTitle: meta.ogTitle || '',
         ogDesc: meta.ogDesc || '',
-        rawTitle: meta.rawTitle || ''
+        rawTitle: meta.rawTitle || '',
+        tried
       }),
     };
   } catch (err) {
@@ -129,6 +130,7 @@ function extractMeta(html, baseUrl) {
   };
   const ogTitle = pick(/<meta\s+property=["']og:title["']\s+content=["']([^"']*)["'][^>]*>/i);
   const ogDesc = pick(/<meta\s+property=["']og:description["']\s+content=["']([^"']*)["'][^>]*>/i);
+  const metaDesc = pick(/<meta\s+name=["']description["']\s+content=["']([^"']*)["'][^>]*>/i);
   const ogImage = pick(/<meta\s+property=["']og:image["']\s+content=["']([^"']*)["'][^>]*>/i);
   const ogImageSecure = pick(/<meta\s+property=["']og:image:secure_url["']\s+content=["']([^"']*)["'][^>]*>/i);
   const ogImageUrl = pick(/<meta\s+property=["']og:image:url["']\s+content=["']([^"']*)["'][^>]*>/i);
@@ -141,9 +143,12 @@ function extractMeta(html, baseUrl) {
     try { image = new URL(image, baseUrl).href; } catch (_) {}
     image = unwrapSafeImage(image);
   }
+  if (!image) {
+    image = extractImageFallback(html, baseUrl);
+  }
 
   const name = ogSite || ogTitle || titleTag || '';
-  const caption = ogDesc || twDesc || '';
+  const caption = ogDesc || twDesc || metaDesc || '';
   return { name, caption, image, ogTitle, ogDesc, rawTitle: titleTag };
 }
 
@@ -173,6 +178,31 @@ function unwrapSafeImage(imageUrl) {
     return imageUrl;
   } catch (_) {
     return imageUrl;
+  }
+}
+
+function extractImageFallback(html, baseUrl) {
+  try {
+    const candidates = [];
+    const re = /<img[^>]+(?:data-src|src)=["']([^"']+)["'][^>]*>/ig;
+    let m;
+    while ((m = re.exec(html)) !== null) {
+      const src = m[1];
+      if (!src) continue;
+      let abs;
+      try { abs = new URL(src, baseUrl).href; } catch (_) { continue; }
+      if (!abs) continue;
+      if (abs.startsWith('data:')) continue;
+      if (/pixel|analytics|spacer/i.test(abs)) continue;
+      if (/\.svg($|\?)/i.test(abs)) continue;
+      candidates.push(abs);
+    }
+    for (const c of candidates) {
+      if (c.includes('/safe_image.php')) return unwrapSafeImage(c);
+    }
+    return candidates[0] || '';
+  } catch (_) {
+    return '';
   }
 }
 

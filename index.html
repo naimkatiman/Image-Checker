@@ -98,8 +98,8 @@ https://www.facebook.com/permalink.php?id=..."
                         <table class="min-w-full table-auto">
                             <thead>
                                 <tr class="text-left text-gray-600">
-                                    <th class="px-4 py-2">Name</th>
                                     <th class="px-4 py-2">Image</th>
+                                    <th class="px-4 py-2">Name</th>
                                     <th class="px-4 py-2">Caption</th>
                                 </tr>
                             </thead>
@@ -202,11 +202,6 @@ https://www.facebook.com/permalink.php?id=..."
         async function analyzePosts() {
             const linksText = (facebookLinks.value || '').trim();
 
-            if (!referenceImageBase64) {
-                showError('Please upload a reference image first.');
-                return;
-            }
-
             if (!linksText) {
                 showError('Please enter at least one Facebook post link.');
                 return;
@@ -237,23 +232,32 @@ https://www.facebook.com/permalink.php?id=..."
         }
 
         async function analyzeLinksWithAI(links) {
-            // 1) Scrape metadata for each link on the server (name, caption, og:image)
-            const metas = await Promise.all(links.map(scrapeFacebookMeta));
+            // 1) Take a screenshot server-side for each link
+            const shots = await Promise.all(links.map(screenshotFacebook));
 
-            // 2) Try AI enhancement for name/caption when missing or generic
-            const aiEnhanced = await Promise.all(metas.map((m, idx) => maybeAiEnhance(m, links[idx])));
+            // 2) Extract fields from screenshot with AI
+            const extracted = await Promise.all(shots.map(s => aiExtractFromScreenshot(s?.dataUrl || '')));
 
-            // 3) pHash-based comparison without AI
-            const statuses = await Promise.all(
-                aiEnhanced.map(meta => classifySameRelative(referenceImageBase64, meta.imageUrl))
-            );
-
-            // 4) Build final results (exactly 3 fields)
-            return aiEnhanced.map((m, i) => ({
-                name: normalizeName(m.name),
-                image: statuses[i],
-                caption: formatCaption(m.caption)
+            // 3) Build final results: image screenshot + minimal fields
+            return extracted.map((e, i) => ({
+                screenshot: shots[i]?.dataUrl || '',
+                name: normalizeName(e?.name || ''),
+                caption: formatCaption(e?.caption || '')
             }));
+        }
+
+        async function screenshotFacebook(url) {
+            try {
+                const res = await fetch('/.netlify/functions/screenshot-post', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ url })
+                });
+                if (!res.ok) throw new Error('Screenshot failed');
+                return await res.json();
+            } catch (e) {
+                return { dataUrl: '' };
+            }
         }
 
         async function scrapeFacebookMeta(url) {
@@ -289,7 +293,8 @@ https://www.facebook.com/permalink.php?id=..."
                 const { dataUrl } = await proxied.json();
                 const postHash = await imageDataUrlToHash(dataUrl);
                 const dist = hamming(refHash, postHash);
-                return dist <= 10 ? 'same' : 'not same';
+                // Slightly higher threshold to reduce false negatives on recompressed images
+                return dist <= 14 ? 'same' : 'not same';
             } catch (_) {
                 return 'not same';
             }
@@ -425,20 +430,47 @@ https://www.facebook.com/permalink.php?id=..."
         function renderResults(items) {
             resultsBody.innerHTML = items.map(item => {
                 const name = sanitize(String(item.name || 'unknown'));
-                const isSame = String(item.image || 'not same') === 'same';
-                const imageText = isSame ? 'same' : 'not same';
+                const img = String(item.screenshot || '');
                 const captionText = String(item.caption || '');
                 const caption = sanitize(captionText);
-                const badgeClass = isSame ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700';
                 return `
                     <tr>
+                        <td class="px-4 py-2 align-top">${img ? `<img src="${img}" alt="post" class="h-24 w-24 object-cover rounded shadow"/>` : ''}</td>
                         <td class="px-4 py-2 align-top">${name}</td>
-                        <td class="px-4 py-2 align-top"><span class="px-2 py-1 rounded ${badgeClass}">${imageText}</span></td>
                         <td class="px-4 py-2 align-top whitespace-pre-wrap">${caption}</td>
                     </tr>
                 `;
             }).join('');
             resultsSection.classList.remove('hidden');
+        }
+
+        async function aiExtractFromScreenshot(dataUrl) {
+            if (!dataUrl) return { name: '', caption: '' };
+            const instruction = 'You are a precise extractor. From this Facebook post screenshot image, extract only two fields: name (poster/page/user name) and caption (main post text). Return strict JSON {"name":"...","caption":"..."}. Do not add any other keys. If a field is not visible, use an empty string.';
+            const payload = {
+                model: MODEL_NAME,
+                messages: [
+                    {
+                        role: 'user',
+                        content: [
+                            { type: 'text', text: instruction },
+                            { type: 'image_url', image_url: { url: dataUrl } }
+                        ]
+                    }
+                ],
+                temperature: 0
+            };
+            const res = await fetch('/.netlify/functions/openrouter-proxy', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+            if (!res.ok) return { name: '', caption: '' };
+            const data = await res.json();
+            const text = data?.choices?.[0]?.message?.content || '';
+            const obj = extractJsonObject(text) || safeDirectJson(text);
+            if (obj && typeof obj === 'object') return { name: obj.name || '', caption: obj.caption || '' };
+            return { name: '', caption: '' };
         }
 
         function sanitize(str) {
