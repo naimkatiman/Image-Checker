@@ -3,6 +3,9 @@
 
 const chromium = require('@sparticuz/chromium');
 const puppeteer = require('puppeteer-core');
+const ENV_COOKIES_JSON = process.env.FACEBOOK_COOKIES_JSON || process.env.FB_COOKIES_JSON || '';
+const ENV_COOKIE_HEADER = process.env.FACEBOOK_COOKIE_HEADER || process.env.FB_COOKIE_HEADER || '';
+const NAV_TIMEOUT = Number(process.env.NAV_TIMEOUT_MS || 10000); // Reduced timeout
 
 exports.handler = async function (event) {
 	const corsHeaders = {
@@ -37,22 +40,15 @@ exports.handler = async function (event) {
 		};
 	}
 
+	const cookies = parseCookies(getCookieInput(event));
+
+	let browser = null;
 	try {
-		let browser = null;
 		let usedFallback = false;
-		// Try Lambda-compatible Chromium first (production)
+		// Prefer local Puppeteer in dev (no AWS Lambda env), fall back to Lambda-compatible Chromium
+		const runningOnLambda = !!process.env.AWS_EXECUTION_ENV;
 		try {
-			const executablePath = await chromium.executablePath();
-			browser = await puppeteer.launch({
-				args: chromium.args,
-				defaultViewport: { width: 640, height: 1024 },
-				executablePath,
-				headless: chromium.headless,
-				ignoreHTTPSErrors: true,
-			});
-		} catch (primaryErr) {
-			// Local fallback (Windows/Netlify CLI) using full Puppeteer bundled Chrome
-			try {
+			if (!runningOnLambda) {
 				const puppeteerLocal = require('puppeteer');
 				browser = await puppeteerLocal.launch({
 					headless: true,
@@ -61,19 +57,51 @@ exports.handler = async function (event) {
 					args: ['--no-sandbox', '--disable-setuid-sandbox']
 				});
 				usedFallback = true;
-			} catch (fallbackErr) {
-				throw new Error(`Chromium launch failed and local fallback not available. Primary: ${primaryErr?.message}; Fallback: ${fallbackErr?.message}`);
+			} else {
+				throw new Error('Use Lambda chromium');
 			}
+		} catch (localErr) {
+			const executablePath = await chromium.executablePath();
+			browser = await puppeteer.launch({
+				args: chromium.args,
+				defaultViewport: { width: 640, height: 1024 },
+				executablePath,
+				headless: chromium.headless,
+				ignoreHTTPSErrors: true,
+			});
 		}
 
 		const page = await browser.newPage();
+		// Tighter timeouts to avoid Netlify Dev 30s cap
+		page.setDefaultNavigationTimeout(NAV_TIMEOUT);
+		page.setDefaultTimeout(NAV_TIMEOUT);
 		// Use a mobile-ish UA to increase chances of seeing content on m/mbasic
 		await page.setUserAgent(
 			'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1'
 		);
 
-		// Be lenient with timeouts due to FB
-		await page.goto(url, { waitUntil: ['domcontentloaded', 'networkidle2'], timeout: 45000 });
+		// Speed up by blocking heavy resources (images, fonts, media, stylesheets)
+		try {
+			await page.setRequestInterception(true);
+			page.on('request', (req) => {
+				const type = req.resourceType();
+				if (type === 'image' || type === 'font' || type === 'media' || type === 'stylesheet' || type === 'other') {
+					return req.abort();
+				}
+				return req.continue();
+			});
+		} catch (_) {}
+
+		// Preload base domain and apply cookies if provided
+		if (cookies && cookies.length) {
+			try {
+				await page.goto('https://mbasic.facebook.com/', { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
+				await page.setCookie(...cookies);
+			} catch (e) {}
+		}
+
+		// Navigate to target
+		await page.goto(url, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
 
 		// Hide potential banners/headers to keep screenshot focused
 		await page.addStyleTag({
@@ -109,6 +137,7 @@ exports.handler = async function (event) {
 			body: JSON.stringify({ dataUrl, url }),
 		};
 	} catch (err) {
+		try { if (browser && typeof browser.close === 'function') { await browser.close(); } } catch (_) {}
 		return {
 			statusCode: 500,
 			headers: { 'Content-Type': 'application/json', ...corsHeaders },
@@ -131,4 +160,58 @@ function normalizeFacebookUrl(input) {
 	}
 }
 
+function getCookieInput(event) {
+	try {
+		const body = event.body ? JSON.parse(event.body) : {};
+		return body.cookies || body.cookie || ENV_COOKIES_JSON || ENV_COOKIE_HEADER || '';
+	} catch (_) {
+		return ENV_COOKIES_JSON || ENV_COOKIE_HEADER || '';
+	}
+}
+
+function parseCookies(input) {
+	if (!input) return [];
+	try {
+		if (Array.isArray(input)) return sanitizeCookiesArray(input);
+		if (typeof input === 'string') {
+			const trimmed = input.trim();
+			if (!trimmed) return [];
+			if (trimmed.startsWith('[')) {
+				const arr = JSON.parse(trimmed);
+				return sanitizeCookiesArray(arr);
+			}
+			// Cookie header string: "name=value; name2=value2"
+			const parts = trimmed.split(';').map(s => s.trim()).filter(Boolean);
+			const arr = parts.map(p => {
+				const eq = p.indexOf('=');
+				if (eq === -1) return null;
+				const name = p.slice(0, eq).trim();
+				const value = p.slice(eq + 1).trim();
+				return { name, value, domain: '.facebook.com', path: '/', httpOnly: false, secure: true };
+			}).filter(Boolean);
+			return arr;
+		}
+	} catch (_) {}
+	return [];
+}
+
+function sanitizeCookiesArray(arr) {
+	if (!Array.isArray(arr)) return [];
+	return arr.map(c => {
+		const name = String(c.name || '').trim();
+		const value = String(c.value || '').trim();
+		if (!name) return null;
+		const out = {
+			name,
+			value,
+			domain: c.domain || '.facebook.com',
+			path: c.path || '/',
+			httpOnly: !!c.httpOnly,
+			secure: typeof c.secure === 'boolean' ? c.secure : true,
+			sameSite: c.sameSite || 'Lax'
+		};
+		if (typeof c.expires === 'number') out.expires = c.expires;
+		return out;
+	}).filter(Boolean);
+}
 
